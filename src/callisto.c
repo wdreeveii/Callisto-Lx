@@ -25,8 +25,6 @@
 #include "server.h"
 #include "eeprom.h"
 
-int debug = 0;
-
 
 /* debug off, disable output, stop: */
 #define RESET_STRING "D0\rGD\rS0\r"
@@ -35,15 +33,15 @@ int debug = 0;
 
 #define HEXDATA_RESET -1
 
-static void hexdata(char c);
-static void run_schedule();
-static int reset();
-static void init();
-static void start();
-static void stop();
-static void start_overview();
-static void finish_overview();
-static void handle_message(const char *msg);
+static void hexdata(config_t * config, int serial_fd, signed char c);
+static void run_schedule(config_t * config);
+static int reset(config_t * config, int serial_fd);
+static void init(config_t * config, int serial_fd);
+static void start(config_t * config, int serial_fd);
+static void stop(int serial_fd);
+static void start_overview(config_t * config, int serial_fd);
+static void finish_overview(config_t * config);
+static void handle_message(config_t * config, int serial_fd, const char *msg);
 
 
 int buffer_size = 0;
@@ -91,18 +89,20 @@ static void usage(const char *prog) {
 }
 
 
-static volatile int killed = 0;
-static int pidfd = -1;
-static const char *pidfile = NULL;
+static volatile sig_atomic_t killed = 0;
 void terminate(int signum) {
-    if (signum < 0) /* negative signal means immediate termination */
-	killed = 2;
-
-    /*int e;*/
+    if (signum < 0) { /* negative signal means immediate termination */
+	   killed = 2;
+	   exit(EXIT_SUCCESS);
+    } else if (signum > 0) {
+	   killed = 1;
+    }
+}
+/*
     if (killed) {
 	if (killed < 2) {
-	    /* stop callisto hw: */
-	    write_serial("GD\rS0\r");
+	    // stop callisto hw: 
+	    write_serial(serial_fd, "GD\rS0\r");
 	    logprintf(LOG_NOTICE, "Failed to die cleanly, data loss possible");
 	}
 	if (pidfd >= 0) {
@@ -119,28 +119,16 @@ void terminate(int signum) {
 
     killed = 1;
 }
+*/
 
-static volatile int switch_buffers = 0;
+
+static volatile sig_atomic_t switch_buffers = 0;
 static void hup_handler(int signum) {
     start_command = 1;
 }
 
-
-
-
-int main(int argc, char **argv) {
-    char *config_dir = NULL,
-	*config_file = NULL,
-	*datadir = NULL,
-	*ovsdir = NULL,
-	*schedulefile = NULL;
-    char c;
-    int i, l;
-    int do_upload = 0, check_only = 0;
-    uid_t server_uid = 0;
-    gid_t server_gid = 0;
-    int use_ipv4 = 0, ipv6only = 0;
-
+config_t parse_options(int argc, char **argv) {
+    config_t config = default_config();
 
     /* parse options */
     while (1) {
@@ -162,222 +150,195 @@ int main(int argc, char **argv) {
             {"ipv6", 0, NULL, '6'},
             {0, 0, 0, 0}
         };
-        
+
         opt = getopt_long(argc, argv, "c:o:O:s:u:LCdDVh46", long_options, NULL);
         if (opt == -1)
             break;
-        
+
         switch (opt) {
-	case 'c':
-	    config_dir = optarg;
-	    break;
-	case 'o':
-	    datadir = optarg;
-	    break;
-	case 'O':
-	    ovsdir = optarg;
-	    break;
-	case 's':
-	    schedulefile = optarg;
-	    break;
-	case 'u':
+        case 'c':
+            config.configdir = optarg;
+            break;
+        case 'o':
+            config.datadir = optarg;
+            break;
+        case 'O':
+            config.ovsdir = optarg;
+            break;
+        case 's':
+            config.schedulefile = optarg;
+            break;
+        case 'u':
             if (getuid() != 0 && geteuid() != 0) {
                 fprintf(stderr, "ERROR: Must be root to change privileges\n");
-                return EXIT_FAILURE;
+                exit(EXIT_FAILURE);
             }
-	    {
+            {
                 struct passwd *pe = NULL;
 
                 if ((pe = getpwnam(optarg)) == NULL) {
                     fprintf(stderr, "error: Invalid user: %s\n", optarg);
-                    return EXIT_FAILURE;
+                    exit(EXIT_FAILURE);
                 }
-                
-                server_uid = pe->pw_uid;
-                server_gid = pe->pw_gid;
-	    }
-	    break;
-	case 'P':
-	    pidfile = optarg;
+
+                config.server_uid = pe->pw_uid;
+                config.server_gid = pe->pw_gid;
+            }
+            break;
+        case 'P':
+            config.pidfile = optarg;
             if (*optarg != '/') {
                 fprintf(stderr, "ERROR: PID file must be an absolute path\n");
-                return EXIT_FAILURE;
+                exit(EXIT_FAILURE);
             }
-	    break;
-	case 'L':
-	    do_upload = 1;
-	    break;
-	case 'C':
-	    check_only = 1;
-	    break;
-	case 'd':
-	    debug = 1;
-	    break;
-	case 'D':
-	    debug = 1;
-	    serial_debug++;
-	    break;
-	case 'V':
-	    printf("e-Callisto for Unix " PACKAGE_VERSION "\n");
-	    return 0;
+            break;
+        case 'L':
+            config.do_upload = 1;
+            break;
+        case 'C':
+            config.check_only = 1;
+            break;
+        case 'd':
+            config.debug = 1;
+            break;
+        case 'D':
+            config.debug = 1;
+            config.serial_debug++;
+            break;
+        case 'V':
+            printf("e-Callisto for Unix " PACKAGE_VERSION "\n");
+            exit(EXIT_SUCCESS);
         case '4':
-            use_ipv4 = 1;
+            config.use_ipv4 = 1;
             break;
         case '6':
-            ipv6only = 1;
+            config.ipv6only = 1;
             break;
-	case 'h':
-	default:
-	    usage(argv[0]);
-	}
+        case 'h':
+        default:
+            usage(argv[0]);
+            exit(EXIT_SUCCESS);
+        }
     }
     
     if (optind < argc) {
-        fprintf(stderr,
-                "Command line should contain only recognized options\n");
+        fprintf(stderr, "Command line should contain only recognized options\n");
         usage(argv[0]);
+        exit(EXIT_FAILURE);
     }
 
-    if (config_dir) {
-	char *d = strrchr(config_dir, '/');
-	if (d) {
-	    config_file = d+1;
-	    *d = 0;
-	} else {
-	    config_file = config_dir;
-	    config_dir = ".";
-	}
-    } else {
-	config_dir = ETCDIR;
-	config_file = "callisto.cfg";
+    return config;
+}
+
+int main(int argc, char **argv) {
+    char c;
+    int i, l;
+    int serial_fd = -1;
+    int pidfd = -1;
+
+    config_t config = parse_options(argc, argv);
+    
+    if (!read_configs(&config)) {
+        fprintf(stderr, "ERROR: Unable to load config files.\n");
+        return EXIT_FAILURE;
     }
 
-    /* Note: the CWD of the program will be config_dir from this point
-       onwards to allow further config files (frq, schedule) to be
-       given without full path i.e. relative to the config
-       directory. */
-    if (chdir(config_dir)) {
-	fprintf(stderr,
-		"ERROR: Cannot access configuration directory %s: %s\n",
-		config_dir, strerror(errno));
-	return EXIT_FAILURE;
-    }
-    if (!read_config(config_file))
-	return EXIT_FAILURE;
-
-    if (!read_channels(config.channelfile))
-	return EXIT_FAILURE;
-
-    if (!init_serial(config.serialport))
-	return EXIT_FAILURE;
-
-    if (pidfile != NULL) {
-        if (unlink(pidfile) && errno != ENOENT) {
-            fprintf(stderr, "ERROR: Cannot remove old PID file: %s\n",
-                    strerror(errno));
-            return EXIT_FAILURE;
-        }
-        pidfd = open(pidfile, O_WRONLY|O_CREAT|O_EXCL, 0644);
-        if (pidfd < 0) {
-            fprintf(stderr, "ERROR: Cannot create PID file: %s\n",
-                    strerror(errno));
-            return EXIT_FAILURE;
-        }
-    }
+    log_init(!config.debug);
 
     buffer_size = config.filetime * config.samplerate;
     buffer[0].data = (uint8_t*)malloc(buffer_size);
     buffer[1].data = (uint8_t*)malloc(buffer_size);
 
     if (!buffer[0].data || !buffer[1].data) {
-	fprintf(stderr, "ERROR: Cannot allocate data buffers\n");
-	return EXIT_FAILURE;
+        fprintf(stderr, "ERROR: Cannot allocate data buffers\n");
+        return EXIT_FAILURE;
     }
 
+    if (config.debug) {
+        logprintf(LOG_DEBUG, "Initializing serial port..");
+    }
+
+    serial_fd = init_serial(config.serialport);
+    if (serial_fd < 0) {
+        fprintf(stderr, "ERROR: The serial port %s could not be initialized.\n", config.serialport);
+        return EXIT_FAILURE;
+    }
     /* in unknown state => "reset" callisto */
-    if (!reset()) {
-	fprintf(stderr,
-		"ERROR: The device at %s does not seem to be Callisto "
-		"(reset failed)\n",
-		config.serialport);
-	return EXIT_FAILURE;
+    if (!reset(&config, serial_fd)) {
+        fprintf(stderr, "ERROR: The device at %s does not seem to be Callisto (reset failed)\n", config.serialport);
+        return EXIT_FAILURE;
     }
 
+    if (config.debug) {
+        logprintf(LOG_DEBUG, "Probing serial port..");
+    }
     /* identify: */
-    write_serial(ID_QUERY);
+    write_serial(serial_fd, ID_QUERY);
     i = 0;
-    while (read_serial(&c)) {
-	message[i] = c;
-	if (i < MAX_MESSAGE-1) i++;
+    while (read_serial(serial_fd, &c)) {
+        message[i] = c;
+        if (i < MAX_MESSAGE-1) i++;
     }
     message[i] = 0;
     l = strlen(ID_RESPONSE);
     if (i < l || strncmp(message, ID_RESPONSE, l)) {
-	fprintf(stderr,
-		"ERROR: The device at %s does not seem to be Callisto "
-		"(ID failed)\n",
-		config.serialport);
-	return EXIT_FAILURE;
+        fprintf(stderr, "ERROR: The device at %s does not seem to be Callisto (ID failed)\n", config.serialport);
+        return EXIT_FAILURE;
     }
     message[0] = 0;
 
-    if (do_upload && !upload_channels())
-	return EXIT_FAILURE;
+    if (config.debug) {
+        logprintf(LOG_DEBUG, "Callisto device detected..");
+    }
 
-    if (check_only)
-	return EXIT_SUCCESS;
+    if (config.do_upload && !upload_channels(&config, serial_fd)) {
+        return EXIT_FAILURE;
+    }
 
-    if (config.net_port > 0 && !server_init(config.net_port, !ipv6only, !use_ipv4))
-	return EXIT_FAILURE;
+    if (config.check_only) {
+        logprintf(LOG_DEBUG, "Initialization checks complete. Exiting..");
+        return EXIT_SUCCESS;
+    }
+
+    if (config.net_port > 0 && !server_init(config.net_port, !config.ipv6only, !config.use_ipv4)) {
+        return EXIT_FAILURE;
+    }
 
     /* drop privileges */
-    if (server_uid > 0) {
-        if (setgid(server_gid) != 0) {
+    if (config.server_uid > 0) {
+        if (setgid(config.server_gid) != 0) {
             fprintf(stderr, "ERROR: Cannot change GID: %s\n", strerror(errno));
             return EXIT_FAILURE;
         }
-        if (setuid(server_uid) != 0) {
+        if (setuid(config.server_uid) != 0) {
             fprintf(stderr, "ERROR: Cannot change UID: %s\n", strerror(errno));
             return EXIT_FAILURE;
         }
     }
 
-    if (datadir)
-	config.datadir = datadir;
-    if (access(config.datadir, W_OK)) {
-	fprintf(stderr,
-		"ERROR: Cannot access data directory %s: %s\n",
-		config.datadir, strerror(errno));
-	return EXIT_FAILURE;
-    }
-    if (ovsdir)
-	config.ovsdir = ovsdir;
-    if (access(config.ovsdir, W_OK)) {
-	fprintf(stderr,
-		"ERROR: Cannot access overview directory %s: %s\n",
-		config.ovsdir, strerror(errno));
-	return EXIT_FAILURE;
-    }
-
-    if (schedulefile)
-	config.schedulefile = schedulefile;
-    if (!read_schedule(config.schedulefile))
-	return EXIT_FAILURE;
-
-    if (!fits_init())
-	return EXIT_FAILURE;
-
-    if (!download_channels())
-	return EXIT_FAILURE;
-
-    /* daemonize */
-    if (!debug && daemonize()) {
-        fprintf(stderr, "ERROR: Cannot daemonize program: %s\n",
-		strerror(errno));
+    if (!fits_init(&config)) {
         return EXIT_FAILURE;
     }
-    /* write pidfile */
-    if (pidfd >= 0) {
+    if (!download_channels(&config, serial_fd)) {
+        return EXIT_FAILURE;
+    }
+
+    /* daemonize */
+    if (!config.debug && daemonize()) {
+        fprintf(stderr, "ERROR: Cannot daemonize program: %s\n", strerror(errno));
+        return EXIT_FAILURE;
+    }
+    if (config.pidfile != NULL) {
+        if (unlink(config.pidfile) && errno != ENOENT) {
+            fprintf(stderr, "ERROR: Cannot remove old PID file: %s\n", strerror(errno));
+            return EXIT_FAILURE;
+        }
+        pidfd = open(config.pidfile, O_WRONLY|O_CREAT|O_EXCL, 0644);
+        if (pidfd < 0) {
+            fprintf(stderr, "ERROR: Cannot create PID file: %s\n", strerror(errno));
+            return EXIT_FAILURE;
+        }
+        /* write pidfile */
         char pidstr[20];
         snprintf(pidstr, 20, "%i\n", getpid());
         write(pidfd, pidstr, strlen(pidstr));
@@ -395,139 +356,143 @@ int main(int argc, char **argv) {
     signal(SIGTERM, terminate);
     signal(SIGINT, terminate);
 
-    log_init(!debug);
-
     if (config.net_port > 0)
-	server_start();
-    fits_start();
+        server_start(&config);
+    fits_start(&config);
 
     logprintf(LOG_NOTICE, "e-Callisto for Unix " PACKAGE_VERSION " started");
 
     /* main loop */
-    init();
+    init(&config, serial_fd);
+
     if (config.autostart)
-	start();
+        start(&config, serial_fd);
+    
     while (1) {
-	if (killed) {
-	    /* stop hw: */
-	    write_serial("GD\rS0\r");
-	    /* wait for FITS write to finish: */
-	    while (save_buffer != -1)
-		msleep(1);
-	    /* If there is data in the current buffer, save
-	       it. Otherwise the other buffer has already been
-	       saved above. */
-	    if (buffer[current_buffer].size > 0) {
-		save_buffer = current_buffer;
-		/* wait for FITS write to finish: */
-		while (save_buffer != -1)
-		    msleep(1);
-	    }
-	    killed = 2;
-	    terminate(0);
-	}
+        if (killed) {
+            if (killed < 2) {
+                /* stop hw: */
+                write_serial(serial_fd, "GD\rS0\r");
+                /* wait for FITS write to finish: */
+                while (save_buffer != -1)
+                    msleep(1);
+                /* If there is data in the current buffer, save
+                   it. Otherwise the other buffer has already been
+                   saved above. */
+                if (buffer[current_buffer].size > 0) {
+                    save_buffer = current_buffer;
+                    /* wait for FITS write to finish: */
+                    while (save_buffer != -1)
+                        msleep(1);
+                }
+            }
+            if (pidfd >= 0) {
+                ftruncate(pidfd, 0);
+                close(pidfd);
+                unlink(config.pidfile);
+            }
+            exit(EXIT_SUCCESS);
+        }
 
-	/* check schedule (if it exists) for start/stop/overview commands */
-	run_schedule();
+        /* check schedule (if it exists) for start/stop/overview commands */
+        run_schedule(&config);
 
-	/* state switching: */
-	if (overview_command) {
-	    if (state == OVERVIEW) { /* already in progress */
-		overview_command = 0;
-	    } else if (state == STARTING || state == RUNNING) {
-		stop();
-		start_command = 1; /* start again after finished */
-	    } else if (state == STOPPED) {
-		start_overview();
-	    }
-	} else if (stop_command) {
-	    if (state == STARTING || state == RUNNING)
-		stop();
-	    stop_command = 0;
-	    start_command = 0;
-	} else if (state == STOPPED && start_command) {
-	    init();
-	    start();
-	    start_command = 0;
-	} else if (state == RUNNING && start_command) {
-	    switch_buffers = 1; /* start a new FITS file */
-	    start_command = 0;
-	}
-
-
-	if (state == STOPPED) {
-	    /* we are stopped => wait for commands */
-	    msleep(1);
-	    continue;
-	}
+        /* state switching: */
+        if (overview_command) {
+            if (state == OVERVIEW) { /* already in progress */
+                overview_command = 0;
+            } else if (state == STARTING || state == RUNNING) {
+                stop(serial_fd);
+                start_command = 1; /* start again after finished */
+            } else if (state == STOPPED) {
+                start_overview(&config, serial_fd);
+            }
+        } else if (stop_command) {
+            if (state == STARTING || state == RUNNING)
+                stop(serial_fd);
+            stop_command = 0;
+            start_command = 0;
+        } else if (state == STOPPED && start_command) {
+            init(&config, serial_fd);
+            start(&config, serial_fd);
+            start_command = 0;
+        } else if (state == RUNNING && start_command) {
+            switch_buffers = 1; /* start a new FITS file */
+            start_command = 0;
+        }
 
 
-	if (!read_serial(&c)) {
-	    if (state == OVERVIEW) {
-		finish_overview();
-		continue;
-	    }
-	    logprintf(LOG_ERR, "Timeout reading from serial port, resetting");
-	    reset();
-	    init();
-	    start();
-	    continue;
-	}
+        if (state == STOPPED) {
+            /* we are stopped => wait for commands */
+            msleep(1);
+            continue;
+        }
 
-	if (in_message && c == MESSAGE_END) {
-	    message[message_length] = 0;
-	    handle_message(message);
-	    message_length = 0;
-	    in_message = 0;
-	    continue;
-	}
 
-	if (!in_message && c == MESSAGE_START) {
-	    message_length = 0;
-	    in_message = 1;
-	    continue;
-	}
+        if (!read_serial(serial_fd, &c)) {
+            if (state == OVERVIEW) {
+                finish_overview(&config);
+                continue;
+            }
+            logprintf(LOG_ERR, "Timeout reading from serial port, resetting");
+            reset(&config, serial_fd);
+            init(&config, serial_fd);
+            start(&config, serial_fd);
+            continue;
+        }
 
-	if (in_message) {
-	    message[message_length] = c;
-	    if (message_length < MAX_MESSAGE-1)
-		message_length++;
-	    continue;
-	}
+        if (in_message && c == MESSAGE_END) {
+            message[message_length] = 0;
+            handle_message(&config, serial_fd, message);
+            message_length = 0;
+            in_message = 0;
+            continue;
+        }
 
-	if (c == EEPROM_READY)
-	    continue;
+        if (!in_message && c == MESSAGE_START) {
+            message_length = 0;
+            in_message = 1;
+            continue;
+        }
 
-	if (!in_data && c == DATA_START) {
-	    in_data = 1;
-	    continue;
-	}
+        if (in_message) {
+            message[message_length] = c;
+            if (message_length < MAX_MESSAGE-1)
+                message_length++;
+            continue;
+        }
+
+        if (c == EEPROM_READY)
+            continue;
+
+        if (!in_data && c == DATA_START) {
+            in_data = 1;
+            continue;
+        }
 	
-	if (in_data && c == DATA_END) {
-	    /* data stream ends => stop state machine, write partial
-	       FITS and reset data buffers: */
-	    in_data = 0;
-	    write_serial("S0\r");
-	    hexdata(HEXDATA_RESET);
-	    /* wait for previous buffer save to finish: */
-	    while (save_buffer != -1)
-		msleep(1);
-	    /* save the current buffer and wait for it to finish: */
-	    save_buffer = current_buffer;
-	    while (save_buffer != -1)
-		msleep(1);
-	    buffer[0].size = buffer[1].size = 0;
-	    continue;
-	}
+        if (in_data && c == DATA_END) {
+            /* data stream ends => stop state machine, write partial
+               FITS and reset data buffers: */
+            in_data = 0;
+            write_serial(serial_fd, "S0\r");
+            hexdata(&config, serial_fd, HEXDATA_RESET);
+            /* wait for previous buffer save to finish: */
+            while (save_buffer != -1)
+        	msleep(1);
+            /* save the current buffer and wait for it to finish: */
+            save_buffer = current_buffer;
+            while (save_buffer != -1)
+        	msleep(1);
+            buffer[0].size = buffer[1].size = 0;
+            continue;
+        }
 
-	if (in_data)
-	    hexdata(c);
-	else {
-	    logprintf(LOG_ERR, "Unexpected character '%c', resetting", c);
-	    reset();
-	}
-
-
+        if (in_data)
+            hexdata(&config, serial_fd, c);
+        else {
+            logprintf(LOG_ERR, "Unexpected character '%c', resetting", c);
+            reset(&config, serial_fd);
+        }
     }
 
     return EXIT_FAILURE;
@@ -536,98 +501,90 @@ int main(int argc, char **argv) {
 
 
 
-
-
-
-
-
-
-
-
-
-
-static void disable_schedule() {
+static void disable_schedule(config_t * config) {
     logprintf(LOG_WARNING, "Disabling scheduling and starting recording");
-    numschedule = 0;
+    config->numschedule = 0;
     if (state != STARTING && state != RUNNING)
 	start_command = 1;
 }
 
 #define SCHEDULE_CHECK_INTERVAL 60
-static void run_schedule() {
+static void run_schedule(config_t * config) {
     int i, hadsched;
     time_t now = time(NULL);
     static time_t last_check = 0;
     static struct stat old_st;
     struct stat st;
-    
+
     /* check for new schedule file: */
-    hadsched = numschedule;
+    hadsched = config->numschedule;
     if (now - last_check >= SCHEDULE_CHECK_INTERVAL) {
-	if (debug)
-	    logprintf(LOG_DEBUG, "Checking for new schedule file");
+        if (config->debug)
+            logprintf(LOG_DEBUG, "Checking for new schedule file");
 
-	last_check = now;
-	if (stat(config.schedulefile, &st)) {
-	    if (errno == ENOENT && hadsched)
-		logprintf(LOG_WARNING, "Schedule file has vanished");
-	    else if (errno != ENOENT)
-		logprintf(LOG_ERR, "Cannot stat schedule file %s: %s",
-			  config.schedulefile, strerror(errno));
-	    if (hadsched)
-		disable_schedule();
-	    if (debug)
-		logprintf(LOG_DEBUG, "(Schedule file stat failed)");
+        last_check = now;
+        if (stat(config->schedulefile, &st)) {
+            if (errno == ENOENT && hadsched)
+                logprintf(LOG_WARNING, "Schedule file has vanished");
+            else if (errno != ENOENT)
+                logprintf(LOG_ERR, "Cannot stat schedule file %s: %s",
+            
+            config->schedulefile, strerror(errno));
+            if (hadsched)
+                disable_schedule(config);
+            if (config->debug)
+                logprintf(LOG_DEBUG, "(Schedule file stat failed)");
 
-	} else if (memcmp(&old_st, &st, sizeof(st))) {
-	    int e = read_schedule(config.schedulefile);
-	    memcpy(&old_st, &st, sizeof(st));
-	    switch(e) {
-	    case 0: /* fail */
-		if (hadsched)
-		    disable_schedule();
-		break;
-	    case 1: /* ok */
-		if (hadsched && !numschedule)
-		    disable_schedule();
-		break;
-	    case 2: /* no file */
-		if (hadsched) {
-		    logprintf(LOG_WARNING, "Schedule file has vanished");
-		    disable_schedule();
-		}
-		break;
-	    }
-	    if (debug)
-		logprintf(LOG_DEBUG, "(Needed to reload schedule file)");
+        } else if (memcmp(&old_st, &st, sizeof(st))) {
+            int e = read_schedule(config);
+            memcpy(&old_st, &st, sizeof(st));
+            switch(e) {
+            case 0: /* fail */
+                if (hadsched)
+                    disable_schedule(config);
+                break;
+            case 1: /* ok */
+                if (hadsched && !config->numschedule)
+                    disable_schedule(config);
+                break;
+            case 2: /* no file */
+                if (hadsched) {
+                    logprintf(LOG_WARNING, "Schedule file has vanished");
+                    disable_schedule(config);
+                }
+                break;
+            }
+            if (config->debug)
+                logprintf(LOG_DEBUG, "(Needed to reload schedule file)");
 
-	} else if (debug)
-	    logprintf(LOG_DEBUG, "(Schedule file not changed)");
+        } else if (config->debug)
+            logprintf(LOG_DEBUG, "(Schedule file not changed)");
     }
-    
 
-    for (i = 0; i < numschedule; i++)
-	if (now >= schedule[i].t) {
-	    switch (schedule[i].action) {
-	    case SCHEDULE_START:
-		start_command = 1;
-		logprintf(LOG_NOTICE, "Recording (re)started by schedule");
-		break;
-	    case SCHEDULE_STOP:
-		stop_command = 1;
-		logprintf(LOG_NOTICE, "Recording stopped by schedule");
-		break;
-	    case SCHEDULE_OVERVIEW:
-		overview_command = 1;
-		logprintf(LOG_NOTICE, "Overview started by schedule");
-		break;
-	    }
-	    schedule[i].t += 86400;
-	}
+
+    for (i = 0; i < config->numschedule; i++) {
+        if (now >= config->schedule[i].t) {
+            switch (config->schedule[i].action) {
+            case SCHEDULE_START:
+                start_command = 1;
+                logprintf(LOG_NOTICE, "Recording (re)started by schedule");
+                break;
+            case SCHEDULE_STOP:
+                stop_command = 1;
+                logprintf(LOG_NOTICE, "Recording stopped by schedule");
+                break;
+            case SCHEDULE_OVERVIEW:
+                overview_command = 1;
+                logprintf(LOG_NOTICE, "Overview started by schedule");
+                break;
+            }
+            config->schedule[i].t += 86400;
+        }
+    }
 }
 
 
-static int reset() {
+static int reset(config_t * config, int serial_fd) {
     static int count = 0;
     static time_t last_reset = 0;
     int i = 10000;
@@ -635,70 +592,71 @@ static int reset() {
     time_t t;
 
     while (save_buffer != -1) /* wait for FITS write to complete */
-	msleep(1);
+        msleep(1);
     buffer[0].size = buffer[1].size = 0;
     current_buffer = active_buffer = 0;
 
-    hexdata(HEXDATA_RESET);
+    hexdata(config, serial_fd, HEXDATA_RESET);
     message_length = in_data = in_message = 0;
     state = STOPPED;
-    
-    write_serial(RESET_STRING);
+
+    write_serial(serial_fd, RESET_STRING);
     /* discard bytes until timeout or 10kB read: */
-    while (i && read_serial(&c))
-	i--;
+    while (i && read_serial(serial_fd, &c))
+        i--;
 
     /* detect continuous resetting: */
     t = time(NULL);
     if (t - last_reset < 5)
-	count++;
+        count++;
     else
-	count = 0;
+        count = 0;
     last_reset = t;
     if (count > 2) {
-	logprintf(LOG_ERR, "Reset loop detected, terminating");
-	terminate(0);
+        logprintf(LOG_ERR, "Reset loop detected, terminating");
+        terminate(0);
     }
 
     return i;
 }
 
-static void init() {
+void init(config_t * config, int serial_fd) {
     char cmd[64];
 
     /* clockrate: */
-    if (config.clocksource == 1) { /* internal */
+    if (config->clocksource == 1) { /* internal */
 	/* Internal clock 11.0592 MHz + prescaler 64x => 172800, 2
 	   clock cycles per sample => 86400. Counter goes from 0 to N-1
 	   (?) */
-        int maxcounter = 86400 / config.samplerate - 1;
+        int maxcounter = 86400 / config->samplerate - 1;
         sprintf(cmd, "GS%u\r", maxcounter);
-	write_serial(cmd);
-    } else if (config.clocksource == 2) { /* external */
+	write_serial(serial_fd, cmd);
+    } else if (config->clocksource == 2) { /* external */
 	/* External clock 1 MHz => 1000000, 2 clock cycles per sample
 	   => 500000. Counter goes from 0 to N-1 (?) */
-	int maxcounter = 500000 / config.samplerate - 1;
+	int maxcounter = 500000 / config->samplerate - 1;
 	sprintf(cmd, "GA%u\r", maxcounter);
-	write_serial(cmd);
+	write_serial(serial_fd, cmd);
     }
 
     /* gain, clocksource, chargepump: */
     sprintf(cmd, "T%u\rO%03u\rC%u\r",
-	    config.clocksource, config.agclevel, config.chargepump);
-    write_serial(cmd);
+	    config->clocksource, config->agclevel, config->chargepump);
+    write_serial(serial_fd, cmd);
 }
 
-static void start() {
+void start(config_t * config, int serial_fd) {
     char cmd[64];
 
     /* FOPA, channels, start, enable: */
     sprintf(cmd, "FS%02u%02u\rL%u\rS1\rGE\r",
-	    config.focuscode, config.focuscode-1, config.nchannels);
-    write_serial(cmd);
+	    config->focuscode, config->focuscode-1, config->nchannels);
+    write_serial(serial_fd, cmd);
     state = STARTING;
 }
-static void stop() {
-    write_serial("GD\r");
+
+void stop(int serial_fd) {
+    write_serial(serial_fd, "GD\r");
     state = STOPPING;
 }
 
@@ -712,22 +670,22 @@ static ovs_t ovs[MAX_OVS];
 static int ovsnum = 0;
 static time_t ovstime = 0; 
 
-static void start_overview() {
-    write_serial("T0\rM2\r%5\rF0045.0\rL13200\rP2\r");
+static void start_overview(config_t * config, int serial_fd) {
+    write_serial(serial_fd, "T0\rM2\r%5\rF0045.0\rL13200\rP2\r");
     state = OVERVIEW;
     ovsnum = 0;
     ovstime = time(NULL);
-    if (debug)
+    if (config->debug)
 	logprintf(LOG_DEBUG, "Started overview");
 }
-static void finish_overview() {
+static void finish_overview(config_t * config) {
     char fname[PATH_MAX];
     struct tm tm;
     FILE *f;
 
     gmtime_r(&ovstime, &tm);
     snprintf(fname, PATH_MAX, "%s/OVS_%s_%04u%02u%02u_%02u%02u%02u.prn",
-	     config.ovsdir, config.instrument,
+	     config->ovsdir, config->instrument,
 	     tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
 	     tm.tm_hour, tm.tm_min, tm.tm_sec);
 
@@ -737,7 +695,7 @@ static void finish_overview() {
     } else {
 	int i;
 	fprintf(f, "Frequency[MHz];Amplitude RX1[mV] at pwm=%u\n",
-		config.agclevel);
+		config->agclevel);
 	for (i = 0; i < ovsnum; i++)
 	    fprintf(f, "%7.3f;%u\n", ovs[i].freq, ovs[i].value);
 	fflush(f);
@@ -745,21 +703,21 @@ static void finish_overview() {
     }
 
     state = STOPPED;
-    if (debug)
+    if (config->debug)
 	logprintf(LOG_DEBUG, "Overview finished");
 }
 
-static void handle_message(const char *msg) {
+static void handle_message(config_t * config, int serial_fd, const char *msg) {
     double ovs_freq;
     int ovs_value;
 
     if (!strcmp(msg, "CRX:Started")) {
 	state = RUNNING;
-	if (debug)
+	if (config->debug)
 	    logprintf(LOG_DEBUG, "Recording loop started");
     } else if (!strcmp(msg, "CRX:Stopped")) {
 	state = STOPPED;
-	if (debug)
+	if (config->debug)
 	    logprintf(LOG_DEBUG, "Recording loop stopped");
     } else if (strstr(msg, "CRX:e-Callisto ETH Zurich")) {
 	/* hardware reset, do reset&init in software: */
@@ -767,10 +725,10 @@ static void handle_message(const char *msg) {
 
 	logprintf(LOG_WARNING, "Hardware reset detected, resetting software");
 
-	reset();
-	init();
+	reset(config, serial_fd);
+	init(config, serial_fd);
 	if (do_start)
-	    start();
+	    start(config, serial_fd);
 
 	/* (the channels are in eeprom => preserved across resets) */
     } else if (state == OVERVIEW
@@ -785,7 +743,7 @@ static void handle_message(const char *msg) {
 
 
 
-static void hexdata(char c) {
+static void hexdata(config_t * config, int serial_fd, signed char c) {
     static int value = 0;
     static int count = 0;
     static int end_marker = 0;
@@ -803,18 +761,18 @@ static void hexdata(char c) {
 	count++;
     } else {
 	logprintf(LOG_ERR, "Invalid hex character '%c', resetting", c);
-	reset();
+	reset(config, serial_fd);
 	return;
     }
 
     if (count == 4) {
 	if (value == 0x2323) {
 	    end_marker++;
-	    if (end_marker == 2 && debug)
+	    if (end_marker == 2 && config->debug)
 		logprintf(LOG_DEBUG, "Hexdata end marker received");
 	    else if (end_marker > 2) {
 		logprintf(LOG_ERR, "Too many hexdata end markers, resetting");
-		reset();
+		reset(config, serial_fd);
 	    }
 	    value = count = 0;
 	    return;
@@ -822,7 +780,7 @@ static void hexdata(char c) {
 
 	if (value & ~0xff) {
 	    logprintf(LOG_ERR, "Invalid hex value 0x%.4X, resetting", value);
-	    reset();
+	    reset(config, serial_fd);
 	    return;
 	} else {
 	    int bsize = buffer[current_buffer].size; /* cache volatile value */
@@ -834,7 +792,7 @@ static void hexdata(char c) {
 	    buffer[current_buffer].size = bsize; /* save cached value */
 	    if (bsize == buffer_size
 		|| (bsize > 0
-		    && (bsize % config.nchannels) == 0
+		    && (bsize % config->nchannels) == 0
 		    && switch_buffers)) {
 		/* wait for FITS thread to finish if it is currently
 		   saving the previous buffer: */

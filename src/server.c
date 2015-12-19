@@ -19,8 +19,19 @@ static int listen_fd = -1;
 
 #define MAXLINE 128
 
-static void *handle_client(void *arg) {
-    int fd = (int)((long)arg);
+typedef struct {
+    int client_fd;
+    config_t * config;
+} clientdata_t;
+
+static void *handle_client(void *ptr) {
+    clientdata_t *data = (clientdata_t *)ptr;
+
+    int fd = data->client_fd;
+    config_t *config = data->config;
+
+    free(data);
+
     int read_fd;
     FILE *f, *read_f;
     char buf[MAXLINE];
@@ -110,22 +121,22 @@ static void *handle_client(void *arg) {
 	    int mybuf = active_buffer;
 	    buffer_t databuf = buffer[mybuf];
 	    int i;
-	    usec_t sweeplen = 1000000 * (usec_t)config.nchannels
-		/ (usec_t)config.samplerate;
+	    usec_t sweeplen = 1000000 * (usec_t)config->nchannels
+		/ (usec_t)config->samplerate;
 	    
-	    databuf.size -= databuf.size % config.nchannels;
+	    databuf.size -= databuf.size % config->nchannels;
 	    if (!databuf.size) { /* empty buffer, try the other one */
 		databuf = buffer[1-mybuf];
-		databuf.size -= databuf.size % config.nchannels;
+		databuf.size -= databuf.size % config->nchannels;
 	    }
 	    if (databuf.size) {
-		usec_t sweep = databuf.size / config.nchannels - 1;
+		usec_t sweep = databuf.size / config->nchannels - 1;
 		databuf.timestamp += sweep * sweeplen;
 		fprintf(f, "OK\nt=%llu.%.6llu\n",
 			databuf.timestamp/1000000, databuf.timestamp%1000000);
-		for (i = 0; i < config.nchannels; i++)
-		    fprintf(f, "ch%.3i=%.3f:%i\n", i+1, channels[i].f,
-			    databuf.data[databuf.size - config.nchannels + i]);
+		for (i = 0; i < config->nchannels; i++)
+		    fprintf(f, "ch%.3i=%.3f:%i\n", i+1, config->channels[i].f,
+			    databuf.data[databuf.size - config->nchannels + i]);
 		fputs("\n", f);
 	    } else
 		fputs("ERROR no data (yet)\n\n", f);
@@ -160,10 +171,10 @@ static void *handle_client(void *arg) {
     return NULL;
 }
 
-static void *server_loop(void *dummy) {
-    int client_fd;
+static void *server_loop(void *ptr) {
+    config_t * config = (config_t *)ptr;
 
-    (void)dummy;
+    int client_fd;
 
     int errorcount = 0;
 
@@ -171,10 +182,14 @@ static void *server_loop(void *dummy) {
         struct sockaddr_in addr;
         socklen_t addr_sz;
         pthread_t handler_thread;
-	pthread_attr_t attr;
+        pthread_attr_t attr;
 
         addr_sz = sizeof(addr);
         client_fd = accept(listen_fd, (struct sockaddr *)&addr, &addr_sz);
+
+        clientdata_t *data = (clientdata_t *)malloc(sizeof(clientdata_t));
+        data->client_fd = client_fd;
+        data->config = config;
 
         if (client_fd < 0) {
             if (errno == EINTR) continue;
@@ -188,17 +203,16 @@ static void *server_loop(void *dummy) {
             continue;
         }
         errorcount = 0;
-        
+
         if (pthread_attr_init(&attr) != 0
-	    || pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0
-	    || pthread_create(&handler_thread, &attr, handle_client,
-			      (void*)((long)client_fd)) != 0
-	    || pthread_attr_destroy(&attr) != 0) {
+            || pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0
+            || pthread_create(&handler_thread, &attr, handle_client, data) != 0
+            || pthread_attr_destroy(&attr) != 0) {
             char msg[] = "ERROR start_thread()\n";
-            int e;
             logprintf(LOG_ERR, "Thread creation failed: %s", strerror(errno));
-            e = write(client_fd, msg, strlen(msg));
+            write(client_fd, msg, strlen(msg));
             close(client_fd);
+            free(data);
         }
 
         microsleep(1); /* sleep the rest of this timeslice */
@@ -264,12 +278,12 @@ int server_init(uint16_t port, int ipv4, int ipv6) {
     return 1;
 }
 
-void server_start() {
+void server_start(config_t * config) {
     pthread_t thread_id;
     pthread_attr_t attr;
     if (pthread_attr_init(&attr) != 0
         || pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0
-        || pthread_create(&thread_id, &attr, server_loop, NULL) != 0
+        || pthread_create(&thread_id, &attr, server_loop, config) != 0
         || pthread_attr_destroy(&attr) != 0) {
 	logprintf(LOG_CRIT, "Cannot create server thread, terminating: %s",
 		  strerror(errno));

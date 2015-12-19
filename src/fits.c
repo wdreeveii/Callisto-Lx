@@ -20,7 +20,7 @@ static int image_w = 0, image_h = 0;
 static uint8_t *image_buffer = NULL;
 static double *image_time = NULL, *image_freq = NULL;
 
-static int write_fits(int buf)	{
+static int write_fits(config_t * config, int buf)	{
     char s[PATH_MAX];
     long naxes[2] = { image_w, image_h };
     long minvalue = 255, maxvalue = 0, l;
@@ -34,23 +34,23 @@ static int write_fits(int buf)	{
     char* tType[2] = { "TIME", "FREQUENCY" };
     char tForm_0[32], tForm_1[32];
     char* tForm[2] = { tForm_0, tForm_1 };
-    double dt = 1.0 / ((double)config.samplerate / (double)config.nchannels);
+    double dt = 1.0 / ((double)config->samplerate / (double)config->nchannels);
     char errstr[FLEN_STATUS];
     
     ut = buffer[buf].timestamp / 1000000;
     gmtime_r(&ut, &t);
     ets = buffer[buf].timestamp
-	  + 1000000 * (usec_t)(image_w*image_h) / (usec_t)config.samplerate;
+	  + 1000000 * (usec_t)(image_w*image_h) / (usec_t)config->samplerate;
     ut = ets / 1000000;
     gmtime_r(&ut, &et);
 
     snprintf(s, PATH_MAX, "!%s/%s_%04u%02u%02u_%02u%02u%02u_%02u.fit",
-	     config.datadir, config.instrument,
+	     config->datadir, config->instrument,
 	     t.tm_year+1900, t.tm_mon+1, t.tm_mday,
 	     t.tm_hour, t.tm_min, t.tm_sec,
-	     config.focuscode);
+	     config->focuscode);
 
-    if (debug)
+    if (config->debug)
 	logprintf(LOG_DEBUG, "Writing FITS file %s", s+1);
     
     fits_create_file(&fptr, s, &status);
@@ -64,15 +64,15 @@ static int write_fits(int buf)	{
     fits_update_key(fptr, TSTRING, "DATE", s, "Time of observation",
 		    &status);
     sprintf(s, "%04u/%02u/%02u  Radio flux density, e-CALLISTO (%s)",
-	    t.tm_year+1900, t.tm_mon+1, t.tm_mday, config.instrument);
+	    t.tm_year+1900, t.tm_mon+1, t.tm_mday, config->instrument);
     fits_update_key(fptr, TSTRING, "CONTENT", s, "Title of image",
 		    &status);
 
-    fits_update_key(fptr, TSTRING, "ORIGIN", (char*)config.origin,
+    fits_update_key(fptr, TSTRING, "ORIGIN", (char*)config->origin,
 		    "Organization name", &status);
     fits_update_key(fptr, TSTRING, "TELESCOP", "Radio Spectrometer",
 		    "Type of instrument", &status);
-    fits_update_key(fptr, TSTRING, "INSTRUME", (char*)config.instrument,
+    fits_update_key(fptr, TSTRING, "INSTRUME", (char*)config->instrument,
 		    "Name of the spectrometer", &status);
     fits_update_key(fptr, TSTRING, "OBJECT", "Sun",
 		    "object description", &status);
@@ -133,7 +133,7 @@ static int write_fits(int buf)	{
 		    "step between first and second element in x-axis [sec]",
 		    &status);
 
-    d = (double)config.nchannels;
+    d = (double)config->nchannels;
     fits_update_key(fptr, TDOUBLE, "CRVAL2", &d,
 		    "value on axis 2 at the reference pixel", &status);
     l = 0;
@@ -153,24 +153,24 @@ static int write_fits(int buf)	{
 		       &status);
 
 
-    d = fabs(config.obs_lat);
+    d = fabs(config->obs_lat);
     fits_update_key(fptr, TDOUBLE, "OBS_LAT", &d,
 		    "observatory latitude in degree", &status);
-    sprintf(s,"%c", config.obs_lat < 0.0 ? 'S' : 'N');
+    sprintf(s,"%c", config->obs_lat < 0.0 ? 'S' : 'N');
     fits_update_key(fptr, TSTRING, "OBS_LAC", s,
 		    "observatory latitude code {N,S}", &status);
-    d = fabs(config.obs_long);
+    d = fabs(config->obs_long);
     fits_update_key(fptr, TDOUBLE, "OBS_LON", &d,
 		    "observatory longitude in degree", &status);
-    sprintf(s,"%c", config.obs_long < 0.0 ? 'W' : 'E');
+    sprintf(s,"%c", config->obs_long < 0.0 ? 'W' : 'E');
     fits_update_key(fptr, TSTRING, "OBS_LOC", s,
 		    "observatory longitude code {E,W}", &status);
-    fits_update_key(fptr, TDOUBLE, "OBS_ALT", &config.obs_height,
+    fits_update_key(fptr, TDOUBLE, "OBS_ALT", &config->obs_height,
 		    "observatory altitude in meter asl", &status);
 
-    fits_update_key(fptr, TSTRING, "FRQFILE", (char*)config.channelfile,
+    fits_update_key(fptr, TSTRING, "FRQFILE", (char*)config->channelfile,
 		    "name of frequency file" , &status);
-    l = config.agclevel;
+    l = config->agclevel;
     fits_update_key(fptr, TLONG, "PWM_VAL", &l,
 		    "PWM value to control tuner gain", &status);
 
@@ -197,7 +197,7 @@ static int write_fits(int buf)	{
     fits_write_col(fptr, TDOUBLE, 1, 1, 1, image_w, image_time, &status);
 
     for (x = 0; x < image_h; x++)
-	image_freq[image_h-1-x] = channels[x].f;
+	image_freq[image_h-1-x] = config->channels[x].f;
     fits_write_col(fptr, TDOUBLE, 2, 1, 1, image_h, image_freq, &status);
 
     fits_close_file(fptr, &status);
@@ -213,18 +213,17 @@ static int write_fits(int buf)	{
 
 
 static pthread_t thread_id;
-static void *fitswriter(void *dummy) {
-    (void)dummy;
-
+static void *fitswriter(void * ptr) {
+    config_t *config = (config_t *)ptr;
     while (1) {
 	while (save_buffer == -1) /* wait for buffer fill */
 	    msleep(100);
 
 	/* update w to support incomplete images: */
-	image_w = buffer[save_buffer].size / config.nchannels;
+	image_w = buffer[save_buffer].size / config->nchannels;
 
 	if (image_w)
-	    write_fits(save_buffer);
+	    write_fits(config, save_buffer);
 
 	save_buffer = -1; /* done */
     }
@@ -232,10 +231,10 @@ static void *fitswriter(void *dummy) {
     return NULL;
 }
 
-int fits_init() {
+int fits_init(config_t * config) {
     /* h and initial w, for memory allocation: */
-    image_h = config.nchannels;
-    image_w = buffer_size / config.nchannels;
+    image_h = config->nchannels;
+    image_w = buffer_size / config->nchannels;
 
     image_buffer =
 	(uint8_t*)malloc(image_w * image_h);
@@ -250,11 +249,11 @@ int fits_init() {
     return 1;
 }
 
-void fits_start() {
+void fits_start(config_t * config) {
     pthread_attr_t attr;
     if (pthread_attr_init(&attr) != 0
         || pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0
-        || pthread_create(&thread_id, &attr, fitswriter, NULL) != 0
+        || pthread_create(&thread_id, &attr, fitswriter, config) != 0
         || pthread_attr_destroy(&attr) != 0) {
 	logprintf(LOG_CRIT,
 		  "Cannot create FITS writer thread, terminating: %s",

@@ -14,7 +14,7 @@
 #define DATA_END '&'
 #define EEPROM_READY ']'
 
-extern int debug;
+//extern int debug;
 
 typedef struct {
     uint8_t *data;

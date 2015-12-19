@@ -2,9 +2,7 @@
 #define CALLISTO_SERIAL_H
 
 int init_serial(const char *devname);
-int read_serial(char *c);
-int write_serial(const char *s);
-
-extern int serial_debug;
+int read_serial(int serial_fd, char *c);
+int write_serial(int serial_fd, const char *s);
 
 #endif

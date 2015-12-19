@@ -18,23 +18,23 @@
 #define LOW_BAND 171.0
 #define MID_BAND 450.0
 #define HIGH_BAND 870.0
-int upload_channels() {
+int upload_channels(config_t * config, int serial_fd) {
     int i;
 
-    if (debug)
-	logprintf(LOG_DEBUG, "Uploading %i channels", config.nchannels);
+    if (config->debug)
+	logprintf(LOG_DEBUG, "Uploading %i channels", config->nchannels);
 
-    for (i = 0; i < config.nchannels; i++) {
+    for (i = 0; i < config->nchannels; i++) {
 	unsigned divider, div_hi, div_lo, control = 0x86, band = 1;
-	double f = fabs(channels[i].f - config.local_oscillator);
+	double f = fabs(config->channels[i].f - config->local_oscillator);
 	char cmd[32];
 	char c = 0;
 
 	divider = (unsigned)((f + IF_INIT) / SYNTHESIZER_RESOLUTION);
 	div_hi = (divider >> 8) & 0xff;
 	div_lo = divider & 0xff;
-
-	if (config.chargepump)
+	printf("UPLOAD: %d:%d\n", div_hi, div_lo);
+	if (config->chargepump)
 	    control |= 0x40;
 
 	if (f < LOW_BAND)
@@ -46,9 +46,9 @@ int upload_channels() {
 
 	sprintf(cmd, "FE%u,%03u,%03u,%03u,%03u\r",
 		i+1, div_hi, div_lo, control, band);
-	write_serial(cmd);
+	write_serial(serial_fd, cmd);
 	while (c != EEPROM_READY) {
-	    if (!read_serial(&c)) {
+	    if (!read_serial(serial_fd, &c)) {
 		fprintf(stderr, "ERROR: Timeout while uploading channels\n");
 		return 0;
 	    }
@@ -58,72 +58,73 @@ int upload_channels() {
     return 1;
 }
 
-int download_channels() {
+int download_channels(config_t * config, int serial_fd) {
     char msg[MAX_MESSAGE];
     char c = 0;
     int i, ch, d1, d2;
     double d;
 
-    if (debug)
-	logprintf(LOG_DEBUG, "Downloading %i channels", config.nchannels);
+    if (config->debug) {
+		logprintf(LOG_DEBUG, "Downloading %i channels", config->nchannels);
+	}
 
     /* Turn on debugging: */
-    write_serial("D1\r");
+    write_serial(serial_fd, "D1\r");
     /* eat the response line: */
-    while (c != '\r')
-	if (!read_serial(&c)) {
-	    fprintf(stderr,
-		    "ERROR: Timeout reading expected message\n");
-	    return 0;
+    while (c != '\r') {
+		if (!read_serial(serial_fd, &c)) {
+	    	fprintf(stderr, "ERROR: Timeout reading expected message\n");
+	    	return 0;
+		}
 	}
+
     /* and the command echo: */
     c = 0;
-    while (c != '\r')
-	if (!read_serial(&c)) {
-	    fprintf(stderr,
-		    "ERROR: Timeout reading expected message\n");
-	    return 0;
+    while (c != '\r') {
+		if (!read_serial(serial_fd, &c)) {
+	    	fprintf(stderr, "ERROR: Timeout reading expected message\n");
+	    	return 0;
+		}
 	}
 
-    for (ch = 0; ch < config.nchannels; ch++) {
-	/* Query the channel: */
-	sprintf(msg, "FR%i\r", ch+1);
-	write_serial(msg);
+    for (ch = 0; ch < config->nchannels; ch++) {
+		/* Query the channel: */
+		sprintf(msg, "FR%i\r", ch+1);
+		write_serial(serial_fd, msg);
 
-	/* read the answer line: */
-	i = 0;
-	c = 0;
-	while (c != '\r' && i < MAX_MESSAGE && read_serial(&c)) {
-	    msg[i] = c;
-	    i++;
-	}
-	if (i == MAX_MESSAGE) i--;
-	msg[i] = 0;
+		/* read the answer line: */
+		i = 0;
+		c = 0;
+		while (c != '\r' && i < MAX_MESSAGE && read_serial(serial_fd, &c)) {
+	    	msg[i] = c;
+	    	i++;
+		}
+		if (i == MAX_MESSAGE) i--;
+		msg[i] = 0;
 	
-	if (msg[i-1] != '\r') {
-	    fprintf(stderr,
-		    "ERROR: Incomplete line while downloading channels: %s\n",
-		    msg);
-	    return 0;
-	}
+		if (msg[i-1] != '\r') {
+	    	fprintf(stderr, "ERROR: Incomplete line while downloading channels: %s\n", msg);
+	    	return 0;
+		}
 
 	/* The firmware prints the decimal part without leading
 	   zeroes. Also, the firmware uses 37.75 as IF_INIT, so it
 	   needs to be corrected here by +0.05 */
-	if (sscanf(msg, "$CRX:Frequency~%d.%dMHz", &d1, &d2) != 2) {
+	if (sscanf(msg, "$CRX:Frequency=%d.%dMHz", &d1, &d2) != 2) {
 	    fprintf(stderr, "ERROR: Invalid response to FR command: %s\n", msg);
 	    return 0;
 	}
+	printf("DOWNLOAD: %d:%d\n", d1, d2);
 	d = (double)(d1*1000+d2)/1000.0 + 0.05;
 
 	/* Compensate for config.local_oscillator: */
 	{
 	    /* d == fabs(f - config.local_oscillator) */
-	    double f1 = d + config.local_oscillator,
-		f2 = config.local_oscillator - d;
+	    double f1 = d + config->local_oscillator,
+		f2 = config->local_oscillator - d;
 	    if (f2 < 0.0) f2 = f1;
 	    /* select the one closest to the configured frequency: */
-	    if (fabs(channels[ch].f - f1) <= fabs(channels[ch].f - f2))
+	    if (fabs(config->channels[ch].f - f1) <= fabs(config->channels[ch].f - f2))
 		d = f1;
 	    else
 		d = f2;
@@ -132,23 +133,24 @@ int download_channels() {
 	/* check the downloaded frequency against the
 	   configured(/uploaded) one (the one percent fudge factor is
 	   there for possible floating point rounding errors): */
-	if (fabs(d - channels[ch].f) > 1.01*SYNTHESIZER_RESOLUTION) {
+	printf("chan: %f -> %f\n", d, config->channels[ch].f);
+	if (fabs(d - config->channels[ch].f) > 1.01*SYNTHESIZER_RESOLUTION) {
 	    fprintf(stderr,
 		    "ERROR: Frequency of channel %i differs from its "
 		    "configured value. Perhaps channels need to be loaded "
 		    "into the EEPROM (e.g. with options '-LC')?\n",
 		    ch+1);
-	    write_serial("D0\r");
+	    write_serial(serial_fd, "D0\r");
 	    return 0;
 	}
 
 	/* Store frequency: */
-	channels[ch].f = d;
+	config->channels[ch].f = d;
 
 	/* eat the command echo: */
 	c = 0;
 	while (c != '\r')
-	    if (!read_serial(&c)) {
+	    if (!read_serial(serial_fd, &c)) {
 		fprintf(stderr,
 			"ERROR: Timeout reading expected message\n");
 		return 0;
@@ -156,7 +158,7 @@ int download_channels() {
     }
 
     /* Turn off debugging: */
-    write_serial("D0\r");
+    write_serial(serial_fd, "D0\r");
 
     return 1;
 }

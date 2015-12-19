@@ -13,21 +13,21 @@
 
 int serial_debug = 0;
 static int ignore_errors = 0;
-static int serial_fd = -1;
 
 int init_serial(const char *devname) {
+    int serial_fd = -1;
     struct termios tc;
 
     if ((serial_fd = open(devname, O_RDWR)) < 0) {
         fprintf(stderr, "ERROR: cannot open serial device %s: %s\n",
                 devname, strerror(errno));
-        return 0;
+        return -1;
     }
 
     if (tcgetattr(serial_fd, &tc)) {
         fprintf(stderr, "ERROR: getting serial settings for %s failed: %s\n",
                 devname, strerror(errno));
-        return 0;
+        return -1;
     }
 
     /* configure as 115200 8N1 no flow control */
@@ -45,13 +45,13 @@ int init_serial(const char *devname) {
     if (tcsetattr(serial_fd, TCSAFLUSH, &tc)) {
         fprintf(stderr, "ERROR: changing serial settings for %s failed: %s\n",
                 devname, strerror(errno));
-        return 0;
+        return -1;
     }
 
-    return 1;
+    return serial_fd;
 }
 
-int read_serial(char *c) {
+int read_serial(int serial_fd, char *c) {
     ssize_t r;
     while ((r = read(serial_fd, c, 1)) != 1) {
 	if (r == 0)
@@ -77,7 +77,7 @@ int read_serial(char *c) {
     return 1;
 }
 
-int write_serial(const char *s) {
+int write_serial(int serial_fd, const char *s) {
     ssize_t w, left = strlen(s);
     const char *ss = s;
     while (left > 0) {

@@ -13,7 +13,7 @@
    (10.70+27.0). This is actually 37.75 in the firmware source code,
    but 37.7 is used in the Windows host software so we use that here
    also. */
-#define IF_INIT 37.7
+#define IF_INIT 36.13
 /* Frequency band limits: */
 #define LOW_BAND 171.0
 #define MID_BAND 450.0
@@ -33,7 +33,7 @@ int upload_channels(config_t * config, int serial_fd) {
 	divider = (unsigned)((f + IF_INIT) / SYNTHESIZER_RESOLUTION);
 	div_hi = (divider >> 8) & 0xff;
 	div_lo = divider & 0xff;
-	printf("UPLOAD: %d:%d\n", div_hi, div_lo);
+
 	if (config->chargepump)
 	    control |= 0x40;
 
@@ -100,61 +100,69 @@ int download_channels(config_t * config, int serial_fd) {
 	    	i++;
 		}
 		if (i == MAX_MESSAGE) i--;
-		msg[i] = 0;
+			msg[i] = 0;
 	
 		if (msg[i-1] != '\r') {
 	    	fprintf(stderr, "ERROR: Incomplete line while downloading channels: %s\n", msg);
 	    	return 0;
 		}
 
-	/* The firmware prints the decimal part without leading
-	   zeroes. Also, the firmware uses 37.75 as IF_INIT, so it
-	   needs to be corrected here by +0.05 */
-	if (sscanf(msg, "$CRX:Frequency=%d.%dMHz", &d1, &d2) != 2) {
-	    fprintf(stderr, "ERROR: Invalid response to FR command: %s\n", msg);
-	    return 0;
-	}
-	printf("DOWNLOAD: %d:%d\n", d1, d2);
-	d = (double)(d1*1000+d2)/1000.0 + 0.05;
+		/* The firmware prints the decimal part without leading
+		   zeroes. Also, the firmware uses 37.75 as IF_INIT, so it
+		   needs to be corrected here by +0.05 */
+		if (sscanf(msg, "$CRX:Frequency=%d.%dMHz", &d1, &d2) != 2) {
+		    fprintf(stderr, "ERROR: Invalid response to FR command: %s\n", msg);
+		    return 0;
+		}
 
-	/* Compensate for config.local_oscillator: */
-	{
-	    /* d == fabs(f - config.local_oscillator) */
-	    double f1 = d + config->local_oscillator,
-		f2 = config->local_oscillator - d;
-	    if (f2 < 0.0) f2 = f1;
-	    /* select the one closest to the configured frequency: */
-	    if (fabs(config->channels[ch].f - f1) <= fabs(config->channels[ch].f - f2))
-		d = f1;
-	    else
-		d = f2;
-	}
+		d = (double)(d1*1000+d2)/1000.0 + 0.05;
 
-	/* check the downloaded frequency against the
-	   configured(/uploaded) one (the one percent fudge factor is
-	   there for possible floating point rounding errors): */
-	printf("chan: %f -> %f\n", d, config->channels[ch].f);
-	if (fabs(d - config->channels[ch].f) > 1.01*SYNTHESIZER_RESOLUTION) {
-	    fprintf(stderr,
-		    "ERROR: Frequency of channel %i differs from its "
-		    "configured value. Perhaps channels need to be loaded "
-		    "into the EEPROM (e.g. with options '-LC')?\n",
-		    ch+1);
-	    write_serial(serial_fd, "D0\r");
-	    return 0;
-	}
+		/* Compensate for config.local_oscillator: */
+		{
+		    /* d == fabs(f - config.local_oscillator) */
+		    double f1 = d + config->local_oscillator,
+			f2 = config->local_oscillator - d;
+		    if (f2 < 0.0) f2 = f1;
+		    /* select the one closest to the configured frequency: */
+		    if (fabs(config->channels[ch].f - f1) <= fabs(config->channels[ch].f - f2))
+			d = f1;
+		    else
+			d = f2;
+		}
 
-	/* Store frequency: */
-	config->channels[ch].f = d;
+		/* check the downloaded frequency against the
+		   configured(/uploaded) one (the one percent fudge factor is
+		   there for possible floating point rounding errors): */
+		if (fabs(d - config->channels[ch].f) > 1.01*SYNTHESIZER_RESOLUTION) {
+		    fprintf(stderr,
+			    "ERROR: Frequency of channel %i differs from its "
+			    "configured value. Perhaps channels need to be loaded "
+			    "into the EEPROM (e.g. with options '-LC')?\n",
+			    ch+1);
+		    write_serial(serial_fd, "D0\r");
+		    return 0;
+		}
 
-	/* eat the command echo: */
-	c = 0;
-	while (c != '\r')
-	    if (!read_serial(serial_fd, &c)) {
-		fprintf(stderr,
-			"ERROR: Timeout reading expected message\n");
-		return 0;
-	    }
+		/* Store frequency: */
+		config->channels[ch].f = d;
+
+		/* eat the eeprom output: */
+		c = 0;
+		while (c != '\r') {
+		    if (!read_serial(serial_fd, &c)) {
+				fprintf(stderr,	"ERROR: Timeout reading expected message\n");
+				return 0;
+		    }
+		}
+
+		/* eat the command echo: */
+		c = 0;
+		while (c != '\r') {
+		    if (!read_serial(serial_fd, &c)) {
+				fprintf(stderr,	"ERROR: Timeout reading expected message\n");
+				return 0;
+		    }
+		}
     }
 
     /* Turn off debugging: */
